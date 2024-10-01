@@ -19,19 +19,18 @@ media_type_to_file_template = {
     "application/vnd.ollama.image.params": "params-{shorthash}.json",
 }
 
-
 def get_short_hash(layer: dict) -> str:
     assert layer["digest"].startswith("sha256:")
     return layer["digest"].partition(":")[2][:12]
-
 
 def format_size(size: int) -> str:
     if size < 1024:
         return f"{size} B"
     if size < 1048576:
         return f"{size // 1024} KB"
-    return f"{size // 1048576} MB"
-
+    if size < 1073741824:
+        return f"{size // 1048576:.2f} MB"
+    return f"{size / 1073741824:.2f} GB"
 
 @dataclasses.dataclass(frozen=True)
 class DownloadJob:
@@ -40,42 +39,59 @@ class DownloadJob:
     blob_url: str
     size: int
 
+async def download_with_resume(client: httpx.AsyncClient, url: str, dest_path: pathlib.Path, total_size: int, progress, task):
+    temp_path = dest_path.with_suffix(f".tmp-{time.time()}")
+    headers = {}
+    mode = "wb"
+    
+    if temp_path.exists():
+        current_size = temp_path.stat().st_size
+        if current_size < total_size:
+            headers["Range"] = f"bytes={current_size}-"
+            mode = "ab"
+            progress.update(task, completed=current_size)
+        else:
+            temp_path.unlink()
+    
+    async with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        with temp_path.open(mode) as f:
+            async for chunk in resp.aiter_bytes(8192):
+                f.write(chunk)
+                progress.update(task, advance=len(chunk))
+    
+    if temp_path.stat().st_size == total_size:
+        temp_path.rename(dest_path)
+    else:
+        raise ValueError(f"Downloaded file size ({temp_path.stat().st_size}) doesn't match expected size ({total_size})")
 
 async def download_blob(
     client: httpx.AsyncClient,
     job: DownloadJob,
     *,
     progress: Progress,
+    max_retries: int = 5,
+    retry_delay: int = 10,
 ):
     job.dest_path.parent.mkdir(parents=True, exist_ok=True)
     task = progress.add_task(
         f"{job.dest_path} ({format_size(job.size)})",
         total=job.size,
     )
-    temp_path = job.dest_path.with_suffix(f".tmp-{time.time()}")
-    try:
-        if job.size < 1048576:
-            resp = await client.get(job.blob_url, follow_redirects=True)
-            resp.raise_for_status()
-            temp_path.write_bytes(resp.content)
-        else:
-            async with client.stream(
-                "GET",
-                job.blob_url,
-                follow_redirects=True,
-            ) as resp:
-                resp.raise_for_status()
-                with temp_path.open("wb") as f:
-                    async for chunk in resp.aiter_bytes(1048576):
-                        f.write(chunk)
-                        progress.update(task, completed=f.tell())
-        assert temp_path.stat().st_size == job.size
-        temp_path.rename(job.dest_path)
-        progress.update(task, completed=job.size)
-    finally:
-        if temp_path.is_file():
-            temp_path.unlink()
-
+    
+    for attempt in range(max_retries):
+        try:
+            await download_with_resume(client, job.blob_url, job.dest_path, job.size, progress, task)
+            return  # Success, exit the function
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning(f"Download attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                log.info(f"Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                log.error(f"Max retries reached. Download failed for {job.dest_path}")
+                raise
 
 async def get_download_jobs_for_image(
     *,
@@ -107,10 +123,9 @@ async def get_download_jobs_for_image(
             size=layer["size"],
         )
 
-
 async def download(*, registry: str, name: str, version: str, dest_dir: str):
     with Progress() as progress:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
             tasks = []
             async for job in get_download_jobs_for_image(
                 client=client,
@@ -125,7 +140,6 @@ async def download(*, registry: str, name: str, version: str, dest_dir: str):
                 tasks.append(download_blob(client, job, progress=progress))
             if tasks:
                 await asyncio.gather(*tasks)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -159,7 +173,6 @@ def main():
             version=version,
         )
     )
-
 
 if __name__ == "__main__":
     main()
