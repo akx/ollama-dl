@@ -53,17 +53,36 @@ async def download_with_resume(client: httpx.AsyncClient, url: str, dest_path: p
         else:
             temp_path.unlink()
     
-    async with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
-        resp.raise_for_status()
-        with temp_path.open(mode) as f:
-            async for chunk in resp.aiter_bytes(8192):
-                f.write(chunk)
-                progress.update(task, advance=len(chunk))
-    
-    if temp_path.stat().st_size == total_size:
-        temp_path.rename(dest_path)
-    else:
-        raise ValueError(f"Downloaded file size ({temp_path.stat().st_size}) doesn't match expected size ({total_size})")
+    try:
+        async with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            log.debug(f"Response headers: {resp.headers}")
+            content_length = int(resp.headers.get('Content-Length', '0'))
+            log.debug(f"Content-Length: {content_length}, Expected total size: {total_size}")
+            
+            with temp_path.open(mode) as f:
+                async for chunk in resp.aiter_bytes(8192):
+                    f.write(chunk)
+                    progress.update(task, advance=len(chunk))
+        
+        downloaded_size = temp_path.stat().st_size
+        log.debug(f"Downloaded size: {downloaded_size}, Expected size: {total_size}")
+        
+        if downloaded_size == total_size:
+            temp_path.rename(dest_path)
+            log.info(f"Successfully downloaded {dest_path}")
+        else:
+            raise ValueError(f"Downloaded file size ({downloaded_size}) doesn't match expected size ({total_size})")
+    except httpx.HTTPStatusError as e:
+        log.error(f"HTTP error occurred: {e}")
+        log.debug(f"Response: {e.response.text}")
+        raise
+    except Exception as e:
+        log.error(f"An error occurred during download: {str(e)}")
+        if temp_path.exists():
+            log.debug(f"Partial download size: {temp_path.stat().st_size}")
+        raise
+
 
 async def download_blob(
     client: httpx.AsyncClient,
@@ -92,7 +111,10 @@ async def download_blob(
             else:
                 log.error(f"Max retries reached. Download failed for {job.dest_path}")
                 raise
-
+        except Exception as e:
+            log.error(f"Unexpected error during download: {str(e)}")
+            raise
+        
 async def get_download_jobs_for_image(
     *,
     client: httpx.AsyncClient,
