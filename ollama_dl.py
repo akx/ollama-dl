@@ -4,11 +4,16 @@ import dataclasses
 import logging
 import pathlib
 import time
+from typing import AsyncIterable
 from urllib.parse import urljoin
 
 import httpx
 from rich.logging import RichHandler
-from rich.progress import Progress
+from rich.progress import Progress, TaskID
+
+BYTES_IN_KILOBYTE = 1024
+BYTES_IN_MEGABYTE = BYTES_IN_KILOBYTE**2
+DOWNLOAD_READ_SIZE = BYTES_IN_MEGABYTE
 
 log = logging.getLogger("ollama-dl")
 
@@ -22,16 +27,17 @@ media_type_to_file_template = {
 
 
 def get_short_hash(layer: dict) -> str:
-    assert layer["digest"].startswith("sha256:")
+    if not layer["digest"].startswith("sha256:"):
+        raise ValueError(f"Unexpected digest: {layer['digest']}")
     return layer["digest"].partition(":")[2][:12]
 
 
 def format_size(size: int) -> str:
-    if size < 1024:
+    if size < BYTES_IN_KILOBYTE:
         return f"{size} B"
-    if size < 1048576:
-        return f"{size // 1024} KB"
-    return f"{size // 1048576} MB"
+    if size < BYTES_IN_MEGABYTE:
+        return f"{size // BYTES_IN_KILOBYTE} KB"
+    return f"{size // BYTES_IN_MEGABYTE} MB"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,9 +55,9 @@ async def _inner_download(
     temp_path: pathlib.Path,
     size: int,
     progress: Progress,
-    task_id,
+    task_id: TaskID,
 ) -> None:
-    if size < 1048576:
+    if size < BYTES_IN_MEGABYTE:
         resp = await client.get(url, follow_redirects=True)
         resp.raise_for_status()
         temp_path.write_bytes(resp.content)
@@ -71,10 +77,11 @@ async def _inner_download(
         headers=headers,
         follow_redirects=True,
     ) as resp:
-        assert resp.status_code == (206 if start_offset else 200)
+        if resp.status_code != (206 if start_offset else 200):
+            raise ValueError(f"Unexpected status code: {resp.status_code}")
         resp.raise_for_status()
         with temp_path.open("ab") as f:
-            async for chunk in resp.aiter_bytes(1048576):
+            async for chunk in resp.aiter_bytes(DOWNLOAD_READ_SIZE):
                 f.write(chunk)
                 progress.update(task_id, completed=f.tell())
 
@@ -85,7 +92,7 @@ async def download_blob(
     *,
     progress: Progress,
     num_retries: int = 10,
-):
+) -> None:
     job.dest_path.parent.mkdir(parents=True, exist_ok=True)
     task_desc = f"{job.dest_path} ({format_size(job.size)})"
     task = progress.add_task(task_desc, total=job.size)
@@ -94,7 +101,8 @@ async def download_blob(
         for attempt in range(1, num_retries + 1):
             if attempt != 1:
                 progress.update(
-                    task, description=f"{task_desc} (retry {attempt}/{num_retries})"
+                    task,
+                    description=f"{task_desc} (retry {attempt}/{num_retries})",
                 )
             try:
                 await _inner_download(
@@ -117,7 +125,11 @@ async def download_blob(
                     raise
             else:
                 break
-        assert temp_path.stat().st_size == job.size
+        result_size = temp_path.stat().st_size
+        if result_size != job.size:
+            raise RuntimeError(
+                f"Did not download expected size: {result_size} != {job.size}",
+            )
         temp_path.rename(job.dest_path)
         progress.update(task, completed=job.size)
     finally:
@@ -132,15 +144,16 @@ async def get_download_jobs_for_image(
     dest_dir: str,
     name: str,
     version: str,
-):
+) -> AsyncIterable[DownloadJob]:
     manifest_url = urljoin(registry, f"v2/{name}/manifests/{version}")
     resp = await client.get(manifest_url)
     resp.raise_for_status()
     manifest_data = resp.json()
-    assert (
-        manifest_data["mediaType"]
-        == "application/vnd.docker.distribution.manifest.v2+json"
-    )
+    manifest_media_type = manifest_data["mediaType"]
+    if manifest_media_type != "application/vnd.docker.distribution.manifest.v2+json":
+        raise ValueError(
+            f"Unexpected media type for manifest: {manifest_media_type}",
+        )
     for layer in sorted(manifest_data["layers"], key=lambda x: x["size"]):
         file_template = media_type_to_file_template.get(layer["mediaType"])
         if not file_template:
@@ -159,7 +172,7 @@ async def get_download_jobs_for_image(
         )
 
 
-async def download(*, registry: str, name: str, version: str, dest_dir: str):
+async def download(*, registry: str, name: str, version: str, dest_dir: str) -> None:
     with Progress() as progress:
         async with httpx.AsyncClient() as client:
             tasks = []
@@ -178,7 +191,7 @@ async def download(*, registry: str, name: str, version: str, dest_dir: str):
                 await asyncio.gather(*tasks)
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
     ap.add_argument("--registry", default="https://registry.ollama.ai/")
@@ -208,7 +221,7 @@ def main():
             name=name,
             dest_dir=dest_dir,
             version=version,
-        )
+        ),
     )
 
 
