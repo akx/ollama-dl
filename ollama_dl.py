@@ -41,34 +41,81 @@ class DownloadJob:
     size: int
 
 
+async def _inner_download(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    temp_path: pathlib.Path,
+    size: int,
+    progress: Progress,
+    task_id,
+) -> None:
+    if size < 1048576:
+        resp = await client.get(url, follow_redirects=True)
+        resp.raise_for_status()
+        temp_path.write_bytes(resp.content)
+        return
+
+    if temp_path.is_file():
+        start_offset = temp_path.stat().st_size
+        headers = {"Range": f"bytes={start_offset}-"}
+
+    else:
+        start_offset = 0
+        headers = {}
+
+    async with client.stream(
+        "GET",
+        url,
+        headers=headers,
+        follow_redirects=True,
+    ) as resp:
+        assert resp.status_code == (206 if start_offset else 200)
+        resp.raise_for_status()
+        with temp_path.open("ab") as f:
+            async for chunk in resp.aiter_bytes(1048576):
+                f.write(chunk)
+                progress.update(task_id, completed=f.tell())
+
+
 async def download_blob(
     client: httpx.AsyncClient,
     job: DownloadJob,
     *,
     progress: Progress,
+    num_retries: int = 10,
 ):
     job.dest_path.parent.mkdir(parents=True, exist_ok=True)
-    task = progress.add_task(
-        f"{job.dest_path} ({format_size(job.size)})",
-        total=job.size,
-    )
+    task_desc = f"{job.dest_path} ({format_size(job.size)})"
+    task = progress.add_task(task_desc, total=job.size)
     temp_path = job.dest_path.with_suffix(f".tmp-{time.time()}")
     try:
-        if job.size < 1048576:
-            resp = await client.get(job.blob_url, follow_redirects=True)
-            resp.raise_for_status()
-            temp_path.write_bytes(resp.content)
-        else:
-            async with client.stream(
-                "GET",
-                job.blob_url,
-                follow_redirects=True,
-            ) as resp:
-                resp.raise_for_status()
-                with temp_path.open("wb") as f:
-                    async for chunk in resp.aiter_bytes(1048576):
-                        f.write(chunk)
-                        progress.update(task, completed=f.tell())
+        for attempt in range(1, num_retries + 1):
+            if attempt != 1:
+                progress.update(
+                    task, description=f"{task_desc} (retry {attempt}/{num_retries})"
+                )
+            try:
+                await _inner_download(
+                    client,
+                    url=job.blob_url,
+                    temp_path=temp_path,
+                    size=job.size,
+                    progress=progress,
+                    task_id=task,
+                )
+            except httpx.TransportError as exc:
+                log.warning(
+                    "%s: Attempt %d/%d failed: %s",
+                    job.blob_url,
+                    attempt,
+                    num_retries,
+                    exc,
+                )
+                if attempt == num_retries:
+                    raise
+            else:
+                break
         assert temp_path.stat().st_size == job.size
         temp_path.rename(job.dest_path)
         progress.update(task, completed=job.size)
