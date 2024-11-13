@@ -144,7 +144,10 @@ async def get_download_jobs_for_image(
     for layer in sorted(manifest_data["layers"], key=lambda x: x["size"]):
         file_template = media_type_to_file_template.get(layer["mediaType"])
         if not file_template:
-            log.warning("Unknown media type: %s", layer["mediaType"])
+            log.warning(
+                "Ignoring layer with unknown media type: %s",
+                layer["mediaType"],
+            )
             continue
         filename = file_template.format(shorthash=get_short_hash(layer))
         dest_path = pathlib.Path(dest_dir) / filename
