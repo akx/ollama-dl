@@ -13,10 +13,11 @@ from rich.progress import Progress
 log = logging.getLogger("ollama-dl")
 
 media_type_to_file_template = {
-    "application/vnd.ollama.image.model": "model-{shorthash}.gguf",
-    "application/vnd.ollama.image.template": "template-{shorthash}.txt",
     "application/vnd.ollama.image.license": "license-{shorthash}.txt",
+    "application/vnd.ollama.image.model": "model-{shorthash}.gguf",
     "application/vnd.ollama.image.params": "params-{shorthash}.json",
+    "application/vnd.ollama.image.system": "system-{shorthash}.txt",
+    "application/vnd.ollama.image.template": "template-{shorthash}.txt",
 }
 
 
