@@ -4,10 +4,10 @@ import dataclasses
 import logging
 import pathlib
 import time
-from typing import AsyncIterable
+from collections.abc import AsyncIterable
 from urllib.parse import urljoin
 
-import httpx
+import httpx2 as httpx
 from rich.logging import RichHandler
 from rich.progress import Progress, TaskID
 

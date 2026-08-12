@@ -7,7 +7,7 @@ Downloads models from the [Ollama](https://ollama.com/library) library.
 If you have [`uv`](https://github.com/astral-sh/uv) installed, you can simply run:
 
 ```
-uv run ollama_dl.py llama3.2
+uv run -m ollama_dl llama3.2
 ```
 
 to have it install the dependencies required and run the script to download the default `latest`
