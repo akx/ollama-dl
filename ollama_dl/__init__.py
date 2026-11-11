@@ -27,9 +27,10 @@ media_type_to_file_template = {
 
 
 def get_short_hash(layer: dict) -> str:
-    if not layer["digest"].startswith("sha256:"):
-        raise ValueError(f"Unexpected digest: {layer['digest']}")
-    return layer["digest"].partition(":")[2][:12]
+    digest = layer.get("digest") or ""
+    if not digest.startswith("sha256:"):
+        raise ValueError(f"Unexpected digest: {digest}")
+    return digest.partition(":")[2][:12]
 
 
 def format_size(size: int) -> str:
